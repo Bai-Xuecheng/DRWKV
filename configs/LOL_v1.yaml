@@ -1,0 +1,29 @@
+# Training configuration
+GPU: [1]
+
+VERBOSE: False
+
+MODEL:
+  MODE: 'LOL_v1'
+
+# Optimization arguments.
+OPTIM:
+  # BATCH: 4 # 8
+  # EPOCHS: 1000  #200
+  # # EPOCH_DECAY: [10]
+  # LR_INITIAL: 2e-4  # 1e-4
+  # LR_MIN: 1e-6
+  # BETA1: 0.9
+
+TRAINING:
+  VAL_AFTER_EVERY: 1
+  RESUME: False   # False
+  PATCH_SIZES: [256, 256, 256]
+  BATCH_SIZES: [2, 2, 2 ]
+  EPOCHS_PER_SIZE: [256, 256, 256]
+  # PATCH_SIZES: [128, 192, 256, 320, 384, 400]
+  # BATCH_SIZES: [16, 16, 8, 8, 4, 2]
+  # EPOCHS_PER_SIZE: [300, 200, 200, 100, 100 ,100]
+  TRAIN_DIR: '/home/WACV/LOLdataset/our485'       # path to training data
+  VAL_DIR: '/home/WACV/LOLdataset/eval15' # path to validation data
+  SAVE_DIR: './checkpoints/LOL_v1/'           # path to save models and images
