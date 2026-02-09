@@ -67,6 +67,24 @@ class _BasePairDataset(Dataset):
         tar = TF.crop(tar, i, j, th, tw)
         return inp, tar
 
+    def _center_crop(self, inp, tar):
+        if self.patch_size <= 0:
+            return inp, tar
+
+        w, h = inp.size
+        if w < self.patch_size or h < self.patch_size:
+            pad_w = max(0, self.patch_size - w)
+            pad_h = max(0, self.patch_size - h)
+            inp = TF.pad(inp, (0, 0, pad_w, pad_h))
+            tar = TF.pad(tar, (0, 0, pad_w, pad_h))
+            w, h = inp.size
+
+        i = (h - self.patch_size) // 2
+        j = (w - self.patch_size) // 2
+        inp = TF.crop(inp, i, j, self.patch_size, self.patch_size)
+        tar = TF.crop(tar, i, j, self.patch_size, self.patch_size)
+        return inp, tar
+
 
 class PatchDataLoaderTrain(_BasePairDataset):
     def __init__(self, images_path, options):
@@ -84,7 +102,7 @@ class PatchDataLoaderVal(_BasePairDataset):
 
     def __getitem__(self, index):
         inp, tar = self._load_pair(index)
-        inp, tar = self._random_crop(inp, tar)
+        inp, tar = self._center_crop(inp, tar)
         return TF.to_tensor(inp), TF.to_tensor(tar)
 
 
