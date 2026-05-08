@@ -23,7 +23,8 @@ T_MAX = 512*512
 
 
 from torch.utils.cpp_extension import load
-wkv_cuda = load(name="wkv", sources=["./cuda/wkv_op.cpp", "./cuda/wkv_cuda.cu"],
+_CUDA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda")
+wkv_cuda = load(name="wkv", sources=[os.path.join(_CUDA_DIR, "wkv_op.cpp"), os.path.join(_CUDA_DIR, "wkv_cuda.cu")],
                 verbose=True, extra_cuda_cflags=['-res-usage', '--maxrregcount 60', '--use_fast_math', '-O3', '-Xptxas -O3', f'-DTmax={T_MAX}'])
 
 

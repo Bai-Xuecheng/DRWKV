@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import List, Tuple
+import re
 
 from PIL import Image
 import torch
@@ -16,17 +17,29 @@ def _list_images(folder: Path) -> List[Path]:
     return sorted([p for p in folder.iterdir() if p.suffix.lower() in _IMAGE_EXTS and p.is_file()])
 
 
+def _find_child_dir(root: Path, names: List[str]) -> Path:
+    name_set = {name.lower() for name in names}
+    for child in root.iterdir():
+        if child.is_dir() and child.name.lower() in name_set:
+            return child
+    raise FileNotFoundError(f"Unable to find one of {names} under {root}")
+
+
+def _pair_key(path: Path) -> str:
+    stem = path.stem.lower()
+    for prefix in _INPUT_DIR_NAMES + _TARGET_DIR_NAMES:
+        if stem.startswith(prefix):
+            stem = stem[len(prefix):]
+            break
+    digits = re.findall(r"\d+", stem)
+    if digits:
+        return digits[-1].lstrip("0") or "0"
+    return stem
+
+
 
 def _resolve_pair_dirs(root: Path) -> Tuple[Path, Path]:
-    for in_name in _INPUT_DIR_NAMES:
-        for gt_name in _TARGET_DIR_NAMES:
-            in_dir = root / in_name
-            gt_dir = root / gt_name
-            if in_dir.is_dir() and gt_dir.is_dir():
-                return in_dir, gt_dir
-    raise FileNotFoundError(
-        f"Unable to find paired folders under {root}. Expected one of {_INPUT_DIR_NAMES} and {_TARGET_DIR_NAMES}."
-    )
+    return _find_child_dir(root, _INPUT_DIR_NAMES), _find_child_dir(root, _TARGET_DIR_NAMES)
 
 
 class _BasePairDataset(Dataset):
@@ -38,8 +51,8 @@ class _BasePairDataset(Dataset):
 
         self.inputs = _list_images(self.input_dir)
         self.targets = _list_images(self.target_dir)
-        target_map = {p.name: p for p in self.targets}
-        self.pairs = [(inp, target_map[inp.name]) for inp in self.inputs if inp.name in target_map]
+        target_map = {_pair_key(p): p for p in self.targets}
+        self.pairs = [(inp, target_map[_pair_key(inp)]) for inp in self.inputs if _pair_key(inp) in target_map]
 
         if not self.pairs:
             raise RuntimeError(f"No paired images found in {self.input_dir} and {self.target_dir}")

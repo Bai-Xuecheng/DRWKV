@@ -1,4 +1,6 @@
 import math
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,9 +12,10 @@ from pytorch_wavelets import DWTForward
 
 # RWKV
 T_MAX = 512*512
+_CUDA_DIR = Path(__file__).resolve().parent / "cuda"
 wkv_cuda = load(
     name="wkv",
-    sources=["/home/WACV/cuda/wkv_op.cpp", "/home/WACV/cuda/wkv_cuda.cu"],
+    sources=[str(_CUDA_DIR / "wkv_op.cpp"), str(_CUDA_DIR / "wkv_cuda.cu")],
     verbose=True,
     extra_cuda_cflags=['-res-usage', '--maxrregcount 60', f'-DTmax={T_MAX}']
 )
@@ -103,8 +106,8 @@ class VRWKV_SpatialMix_Coil(nn.Module):
         self.device = None
         self.recurrence = 2
         self.scan_schemes = scan_schemes or [
-            ('top-left', 'True'), ('top-right', 'True'), ('bottom-left', 'True'), ('bottom-right', 'True'),
-            ('top-left', 'False'), ('top-right', 'False'), ('bottom-left', 'False'), ('bottom-right', 'False')]
+            ('top-left', True), ('top-right', True), ('bottom-left', True), ('bottom-right', True),
+            ('top-left', False), ('top-right', False), ('bottom-left', False), ('bottom-right', False)]
         self.dwconv = nn.Conv2d(n_embd, n_embd, kernel_size=3, stride=1, padding=1, groups=n_embd, bias=False)
         self.key = nn.Linear(n_embd, attn_sz, bias=False)
         self.value = nn.Linear(n_embd, attn_sz, bias=False)
@@ -184,7 +187,7 @@ class VRWKV_SpatialMix_Coil(nn.Module):
                 v = RUN_CUDA(B, T, C, self.spatial_decay[j] / T, self.spatial_first[j] / T, k, v)
             else:
                 h, w = resolution
-                new_h, new_w = (h, w) if selected_scheme[1] == 'True' else (w, h)
+                new_h, new_w = (h, w) if selected_scheme[1] else (w, h)
                 spiral_order = self.get_coil_indices(new_h, new_w, start_corner=selected_scheme[0],
                                                        clockwise=selected_scheme[1])
                 k = rearrange(k, 'b (h w) c -> b c h w', h=h, w=w)
@@ -406,15 +409,40 @@ class Illumination(nn.Module):
         )
         self.noise_head = nn.Conv2d(in_channels=8, out_channels=3, kernel_size=1)
         self.illumination_head = nn.Conv2d(in_channels=8, out_channels=1, kernel_size=1)
+        self.edge_head = nn.Conv2d(in_channels=8, out_channels=1, kernel_size=1)
+        self.artifact_head = nn.Conv2d(in_channels=8, out_channels=3, kernel_size=1)
+        self.alpha = nn.Parameter(torch.tensor(1.0))
+        self.beta = nn.Parameter(torch.tensor(0.0))
+        self.gamma = nn.Parameter(torch.tensor(0.4))
 
     def forward(self, x):
-        illum_map = x.mean(dim=1, keepdim=True)  # 灰度世界理论估计全局光照
+        eps = 1e-4
+        illum_map = x.mean(dim=1, keepdim=True)
         x_shared = self.shared_stage(x)
-        noise = torch.tanh(self.noise_head(x_shared))   # 噪声估计
-        illumination = torch.sigmoid(self.illumination_head(x_shared))  # 继续全局光照估计
-        restored_reflection = (x - noise) / (illumination)
-        restored = x * illumination + restored_reflection 
-        return illum_map, noise, restored
+        noise = torch.tanh(self.noise_head(x_shared))
+        local_illumination = torch.sigmoid(self.illumination_head(x_shared))
+        illumination = torch.clamp(0.5 * (illum_map + local_illumination), min=eps, max=1.0)
+        edge = torch.tanh(self.edge_head(x_shared))
+        artifact = torch.tanh(self.artifact_head(x_shared))
+
+        alpha = F.softplus(self.alpha)
+        beta = torch.tanh(self.beta)
+        gamma = F.softplus(self.gamma) + eps
+        reflection = (x - noise - artifact - alpha * edge) / illumination
+        restored = reflection * torch.pow(illumination, gamma) + beta * edge
+
+        return {
+            "illumination": illumination,
+            "gray_illumination": illum_map,
+            "noise": noise,
+            "edge": edge,
+            "artifact": artifact,
+            "reflection": reflection,
+            "restored": restored,
+            "alpha": alpha,
+            "beta": beta,
+            "gamma": gamma,
+        }
 
 # WTFDown
 class WTFDown(nn.Module):#小波变化高低频分解下采样模块
@@ -590,7 +618,7 @@ class Net(nn.Module):
         )   # 128
 
         self.Coil_RWKV_Stage3 = Coil_RWKV(
-            img_size=img_size[1], in_chans=dim*8, out_chans=dim*2, inner_dim=dim*8, outer_dim=dim*2, num_blocks=num_blocks[1]
+            img_size=img_size[1], in_chans=dim*4, out_chans=dim*2, inner_dim=dim*4, outer_dim=dim*2, num_blocks=num_blocks[1]
         )   # 256
 
         self.Coil_RWKV_Stage4 = Coil_RWKV(
@@ -603,11 +631,10 @@ class Net(nn.Module):
         self.outproj = nn.Conv2d(in_channels=dim, out_channels=3, kernel_size=3, stride=1, padding=1, bias=True)
         
 
-    def forward(self, x):
-        # illum_map, noise, restored = self.illum(x)
+    def forward(self, x, return_aux=False):
+        illum = self.illum(x)
 
-        # Coil_RWKV_in = self.proj(restored * x)
-        Coil_RWKV_in = self.proj(x)
+        Coil_RWKV_in = self.proj(illum["restored"] * x)
         Coil_RWKV_Stage1 = self.Coil_RWKV_Stage1(Coil_RWKV_in)
         Coil_RWKV_Stage1_Down = self.WTD_1(Coil_RWKV_Stage1)
 
@@ -624,7 +651,16 @@ class Net(nn.Module):
         Coil_RWKV_Stage4_in = torch.cat([Coil_RWKV_Stage1, Coil_RWKV_Stage4_Up],dim=1)# self.CFEM_2([Coil_RWKV_Stage1, Coil_RWKV_Stage4_Up])
         Coil_RWKV_Stage4 = self.Coil_RWKV_Stage4(Coil_RWKV_Stage4_in)
 
-        return self.outproj(Coil_RWKV_Stage4)
+        residual = self.outproj(Coil_RWKV_Stage4)
+        enhanced = illum["restored"] + residual
+        if not return_aux:
+            return enhanced
+
+        illum.update({
+            "residual": residual,
+            "enhanced": enhanced,
+        })
+        return illum
         # Coil_RWKV_Out_illum = torch.sigmoid(self.outproj(Coil_RWKV_Stage4))
 
         # # R · (Sg + St) + N
