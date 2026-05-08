@@ -1,4 +1,5 @@
 
+import os
 import time
 import random
 import numpy as np
@@ -10,10 +11,12 @@ from thop import clever_format
 from tensorboardX import SummaryWriter
 
 
+DEFAULT_YML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "LOL_v2_real.yaml")
+
 parser = argparse.ArgumentParser(description='Hyper-parameters for URWKV')
-parser.add_argument('--gpu_id', type=str, default=0)
+parser.add_argument('--gpu_id', type=str, default="0")
 parser.add_argument('--model_name', type=str, default='testpath')
-parser.add_argument('--yml_path', default="/home/WACV_3/configs/LOL_v2_real.yaml", type=str)
+parser.add_argument('--yml_path', default=DEFAULT_YML_PATH, type=str)
 parser.add_argument('--pretrain_weights', default='', type=str, help='Path to weights')
 parser.add_argument('--channel', type=int, default=16)
 parser.add_argument('--batch_size', type=int, default=8)
@@ -23,7 +26,6 @@ parser.add_argument('--lr_min', type=float, default=1e-6)
 args = parser.parse_args()
 
 # other imports
-import os
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
 import sys
 sys.path.append('.')
@@ -37,13 +39,16 @@ from torch.utils.data import DataLoader
 
 
 # custom imports
-from loss import VGGLoss, SSIM_loss
+from loss import MS2Loss
 from Block import Net
 import custom_utils
 from custom_utils.dataset_utils import DataLoaderX
 from custom_utils.data_loaders.lol import PatchDataLoaderTrain, PatchDataLoaderVal, wholeDataLoader
 from custom_utils.warmup_scheduler.scheduler import GradualWarmupScheduler
 from custom_utils import network_parameters
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is required to train DRWKV because the WKV operator is implemented as a CUDA extension.")
+device = torch.device("cuda")
 torch.cuda.empty_cache()
 
 ## Set Seeds
@@ -62,7 +67,8 @@ print("load training yaml file: %s"%(yaml_file))
 
 Train = opt['TRAINING']
 print(Train)
-OPT = opt['OPTIM']
+OPT = opt.get('OPTIM') or {}
+LOSS = opt.get('LOSS') or {}
 
 ## Build Model
 print('==> Build the model')
@@ -76,10 +82,10 @@ model_restored = Net(
 
 
 test_tensor = torch.randn(1, 3, 256, 256)
-flops, params = profile(model_restored.cuda(), ((test_tensor.cuda()),))
+model_restored = model_restored.to(device)
+flops, params = profile(model_restored, ((test_tensor.to(device)),))
 params_number = params / 1000000.0
 flops_number = flops / 1000000000.0
-model_restored.cuda()
 
 ## Training model path direction
 mode = args.model_name
@@ -126,7 +132,7 @@ if Train['RESUME']:
 
 # pretrain
 if args.pretrain_weights:
-    checkpoint = torch.load(args.pretrain_weights)
+    checkpoint = torch.load(args.pretrain_weights, map_location=device)
     model_restored.load_state_dict(checkpoint["state_dict"])
     # state_dict = checkpoint["state_dict"]
     # new_state_dict = OrderedDict()
@@ -137,7 +143,15 @@ if args.pretrain_weights:
 
 
 ## Loss
-L1_loss, ssim_loss, vgg_loss = nn.L1Loss(), SSIM_loss(), VGGLoss(device=args.gpu_id)
+criterion = MS2Loss(
+    lambda_recon=float(LOSS.get('LAMBDA_RECON', 1.0)),
+    lambda_sparse=float(LOSS.get('LAMBDA_SPARSE', 0.01)),
+    lambda_smooth=float(LOSS.get('LAMBDA_SMOOTH', 0.1)),
+    lambda_artifact=float(LOSS.get('LAMBDA_ARTIFACT', 0.05)),
+    lambda_reg=float(LOSS.get('LAMBDA_REG', 1e-4)),
+    edge_aware_weight=float(LOSS.get('EDGE_AWARE_WEIGHT', 10.0)),
+    artifact_tv_weight=float(LOSS.get('ARTIFACT_TV_WEIGHT', 0.1)),
+)
 
 def load_data(train_dir, train_patchsize, val_dir, val_patchsize, train_batch_size, val_batch_size, shuffle=True, num_workers=16, drop_last=False):
     
@@ -206,6 +220,7 @@ print('==> Multi-scale Training start with patch_sizes: ', patch_sizes, 'Batchsi
 for epoch in range(start_epoch, args.epochs + 1):
     epoch_start_time = time.time()
     epoch_loss = 0
+    epoch_loss_items = {}
     train_id = 1
 
     # if current_size_epochs >= epochs_per_size[current_size_index]:
@@ -233,18 +248,20 @@ for epoch in range(start_epoch, args.epochs + 1):
         # Forward propagation
         for param in model_restored.parameters():
             param.grad = None
-        input_ = data[0].cuda()
-        target = data[1].cuda()
-        total_illum, noise, restored = model_restored(input_)
-        restored = restored + torch.clamp((((input_ - noise) / total_illum) * torch.pow(total_illum, 0.4)), min=0, max=1)
+        input_ = data[0].to(device, non_blocking=True)
+        target = data[1].to(device, non_blocking=True)
+        outputs = model_restored(input_, return_aux=True)
+        restored = outputs["enhanced"]
         # Compute loss
-        loss = L1_loss(restored, target)+ (1 - ssim_loss(restored, target)) +  0.1*vgg_loss(restored, target)
+        loss, loss_items = criterion(outputs, target, input_)
 
         # Back propagation
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model_restored.parameters(), max_norm=1.0)
         optimizer.step()
         epoch_loss += loss.item()
+        for key, value in loss_items.items():
+            epoch_loss_items[key] = epoch_loss_items.get(key, 0.0) + value.item()
 
     ## Evaluation (Validation)
     if epoch % Train['VAL_AFTER_EVERY'] == 0:
@@ -252,13 +269,11 @@ for epoch in range(start_epoch, args.epochs + 1):
         psnr_val_rgb = []
         ssim_val_rgb = []
         for ii, data_val in enumerate(val_loader, 0):
-            input_ = data_val[0].cuda()
-            target = data_val[1].cuda()
+            input_ = data_val[0].to(device, non_blocking=True)
+            target = data_val[1].to(device, non_blocking=True)
             h, w = target.shape[2], target.shape[3]
             with torch.no_grad():
-                # restored = model_restored(input_)
-                total_illum, noise, restored = model_restored(input_)
-                restored = restored + torch.clamp((((input_ - noise) / total_illum) * torch.pow(total_illum, 0.4)), min=0, max=1)
+                restored = model_restored(input_)
                 restored = restored[:, :, :h, :w]
             for res, tar in zip(restored, target):
                 psnr_val_rgb.append(custom_utils.torchPSNR(res, tar))
@@ -305,6 +320,9 @@ for epoch in range(start_epoch, args.epochs + 1):
                 }, os.path.join(model_dir, "model_latest.pth"))
 
     writer.add_scalar('train/loss', epoch_loss, epoch)
+    num_batches = max(1, len(train_loader))
+    for key, value in epoch_loss_items.items():
+        writer.add_scalar(key, value / num_batches, epoch)
     writer.add_scalar('train/lr', scheduler.get_lr()[0], epoch)
 writer.close()
 

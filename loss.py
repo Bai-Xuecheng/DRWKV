@@ -8,11 +8,15 @@ import torchvision.models as models
 # other import
 import os
 import math
-import cv2
 import numpy as np
 from math import exp
-from pytorch_ssim import _ssim, create_window
 from torchvision import models, transforms
+
+try:
+    from pytorch_ssim import _ssim, create_window
+except ModuleNotFoundError:
+    _ssim = None
+    create_window = None
 
 
 # class VGGLoss(nn.Module):
@@ -82,6 +86,8 @@ class VGGLoss(nn.Module):
 class SSIM_loss(torch.nn.Module):
     def __init__(self, window_size=11, size_average=True):
         super(SSIM_loss, self).__init__()
+        if create_window is None:
+            raise ModuleNotFoundError("pytorch_ssim is required to use SSIM_loss")
         self.window_size = window_size
         self.size_average = size_average
         self.channel = 1
@@ -115,6 +121,97 @@ class L1_Charbonnier_loss(torch.nn.Module):
         error = torch.sqrt(diff * diff + self.eps)
         loss = torch.mean(error)
         return loss
+
+
+def _spatial_gradients(x):
+    grad_x = x[:, :, :, 1:] - x[:, :, :, :-1]
+    grad_y = x[:, :, 1:, :] - x[:, :, :-1, :]
+    return grad_x, grad_y
+
+
+def _total_variation(x):
+    grad_x, grad_y = _spatial_gradients(x)
+    return grad_x.abs().mean() + grad_y.abs().mean()
+
+
+class MS2Loss(nn.Module):
+    """Multi-Structure Spectral Smoothness Loss from the DRWKV paper.
+
+    The model output is expected to be a dictionary containing the enhanced
+    image plus GER auxiliary maps: edge, illumination, artifact, and the
+    alpha/beta/gamma regularization parameters.
+    """
+
+    def __init__(
+        self,
+        lambda_recon=1.0,
+        lambda_sparse=0.01,
+        lambda_smooth=0.1,
+        lambda_artifact=0.05,
+        lambda_reg=1e-4,
+        edge_aware_weight=10.0,
+        artifact_tv_weight=0.1,
+    ):
+        super().__init__()
+        self.lambda_recon = lambda_recon
+        self.lambda_sparse = lambda_sparse
+        self.lambda_smooth = lambda_smooth
+        self.lambda_artifact = lambda_artifact
+        self.lambda_reg = lambda_reg
+        self.edge_aware_weight = edge_aware_weight
+        self.artifact_tv_weight = artifact_tv_weight
+        self.reconstruction = nn.L1Loss()
+
+    def _illumination_smoothness(self, illumination, low_light):
+        illum_dx, illum_dy = _spatial_gradients(illumination)
+        image_dx, image_dy = _spatial_gradients(low_light.mean(dim=1, keepdim=True))
+
+        smooth_x = illum_dx.abs() * torch.exp(-self.edge_aware_weight * image_dx.abs())
+        smooth_y = illum_dy.abs() * torch.exp(-self.edge_aware_weight * image_dy.abs())
+        return smooth_x.mean() + smooth_y.mean()
+
+    def _regularization(self, output):
+        params = []
+        for name in ("alpha", "beta", "gamma"):
+            value = output.get(name)
+            if value is not None:
+                params.append(value.pow(2).mean())
+        if not params:
+            enhanced = output["enhanced"]
+            return enhanced.new_tensor(0.0)
+        return torch.stack(params).sum()
+
+    def forward(self, output, target, low_light):
+        if not isinstance(output, dict):
+            output = {"enhanced": output}
+
+        enhanced = output["enhanced"]
+        edge = output.get("edge", enhanced.new_zeros(enhanced.shape[0], 1, enhanced.shape[2], enhanced.shape[3]))
+        illumination = output.get("illumination", low_light.mean(dim=1, keepdim=True))
+        artifact = output.get("artifact", torch.zeros_like(enhanced))
+
+        loss_recon = self.reconstruction(enhanced, target)
+        loss_sparse = edge.abs().mean()
+        loss_smooth = self._illumination_smoothness(illumination, low_light)
+        loss_artifact = artifact.abs().mean() + self.artifact_tv_weight * _total_variation(artifact)
+        loss_reg = self._regularization(output)
+
+        total = (
+            self.lambda_recon * loss_recon
+            + self.lambda_sparse * loss_sparse
+            + self.lambda_smooth * loss_smooth
+            + self.lambda_artifact * loss_artifact
+            + self.lambda_reg * loss_reg
+        )
+        components = {
+            "loss/recon": loss_recon.detach(),
+            "loss/sparse": loss_sparse.detach(),
+            "loss/smooth": loss_smooth.detach(),
+            "loss/artifact": loss_artifact.detach(),
+            "loss/reg": loss_reg.detach(),
+            "loss/total": total.detach(),
+        }
+        return total, components
  
 # Perpectual Loss
 class LossNetwork(torch.nn.Module):

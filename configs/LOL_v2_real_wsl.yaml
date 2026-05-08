@@ -1,0 +1,33 @@
+# Example training configuration for LOL-v2 Real_captured on WSL.
+# Update the dataset and checkpoint paths before running on your machine.
+GPU: [0]
+
+VERBOSE: False
+
+MODEL:
+  MODE: 'LOL_v2_real'
+
+OPTIM:
+  # LR_INITIAL: 2e-4
+  # LR_MIN: 1e-6
+  # BETA1: 0.9
+
+LOSS:
+  # MS2-Loss weights from the DRWKV paper.
+  LAMBDA_RECON: 1.0
+  LAMBDA_SPARSE: 0.01
+  LAMBDA_SMOOTH: 0.1
+  LAMBDA_ARTIFACT: 0.05
+  LAMBDA_REG: 0.0001
+  EDGE_AWARE_WEIGHT: 10.0
+  ARTIFACT_TV_WEIGHT: 0.1
+
+TRAINING:
+  VAL_AFTER_EVERY: 1
+  RESUME: False
+  PATCH_SIZES: [256]
+  BATCH_SIZES: [1]
+  EPOCHS_PER_SIZE: [1]
+  TRAIN_DIR: '/path/to/LOL-v2/Real_captured/Train'
+  VAL_DIR: '/path/to/LOL-v2/Real_captured/Test'
+  SAVE_DIR: '/path/to/checkpoints/DRWKV/LOL_v2_real'
